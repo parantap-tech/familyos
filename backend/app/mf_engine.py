@@ -39,9 +39,11 @@ ALLOWLIST = [
     "getSmartRedemptionPlan", "getTaxAwareRedemptionPlan", "getSipBook", "getSipSchedule", "getSipProjection",
     "getPortfolioStressTest", "getRiskProfileStatus", "getPendingActions", "calculateGoalPlan",
     "calculateRetirementPlan", "calculateEmergencyFund", "getCasImportHistory", "searchFunds", "getFundDetail",
+    "getPortfolioFactorExposure", "getHouseholdTaxHarvestPlan", "getLiquidityLadder",
 ]
 MUTATIONS = {"submitRiskProfile", "stageBucketPurchaseCart"}
-HEAVY = {"getPortfolioXray", "getPortfolioFactorExposure", "getPortfolioStressTest", "comparePortfolioFunds", "getSmartRedemptionPlan"}
+HEAVY = {"getPortfolioXray", "getPortfolioFactorExposure", "getPortfolioStressTest", "comparePortfolioFunds", "getSmartRedemptionPlan",
+         "getHouseholdTaxHarvestPlan", "getLiquidityLadder"}
 PREFIX = "mf_"
 
 _tools_cache: dict[str, Any] = {"at": 0.0, "tools": None, "error": None}

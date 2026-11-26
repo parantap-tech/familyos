@@ -180,6 +180,9 @@ policy, co-pay, waiting periods), loan moratoriums (future EMIs), and AIS vs ITR
 or "protection for the family", never graphic or alarming wording, and focus on what would keep the family secure.
 - Tools prefixed mf_ are LIVE mutual-fund data from MF Engine for the asker only (holdings, XIRR, capital gains, \
 tax-aware redemption plans, SIPs, stress tests). Prefer them for mutual-fund questions; their numbers are verified facts. \
+Use mf_getLiquidityLadder (target_amount, needed_by) when a goal needs cash from mutual funds, e.g. a down payment; \
+use mf_getHouseholdTaxHarvestPlan for family tax-harvesting questions (it covers every member only when the asker is the \
+MF Engine family head; otherwise relay its visibility_note). \
 Resolve scheme ids from earlier results, never invent them. They cannot place orders: point to the MF Engine app for that. \
 When you use them, end the answer with: "Mutual fund investments are subject to market risks." \
 If an mf_ tool returns an error, continue with FamilyOS records and say live data was unavailable.
