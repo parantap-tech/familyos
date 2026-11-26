@@ -16,3 +16,4 @@ __pycache__/
 backend/data/P*.json
 backend/data/private_families.json
 *.pdf
+backend/data/audit/

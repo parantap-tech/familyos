@@ -39,9 +39,11 @@ ALLOWLIST = [
     "getSmartRedemptionPlan", "getTaxAwareRedemptionPlan", "getSipBook", "getSipSchedule", "getSipProjection",
     "getPortfolioStressTest", "getRiskProfileStatus", "getPendingActions", "calculateGoalPlan",
     "calculateRetirementPlan", "calculateEmergencyFund", "getCasImportHistory", "searchFunds", "getFundDetail",
+    "getPortfolioFactorExposure", "getHouseholdTaxHarvestPlan", "getLiquidityLadder",
 ]
 MUTATIONS = {"submitRiskProfile", "stageBucketPurchaseCart"}
-HEAVY = {"getPortfolioXray", "getPortfolioFactorExposure", "getPortfolioStressTest", "comparePortfolioFunds", "getSmartRedemptionPlan"}
+HEAVY = {"getPortfolioXray", "getPortfolioFactorExposure", "getPortfolioStressTest", "comparePortfolioFunds", "getSmartRedemptionPlan",
+         "getHouseholdTaxHarvestPlan", "getLiquidityLadder"}
 PREFIX = "mf_"
 
 _tools_cache: dict[str, Any] = {"at": 0.0, "tools": None, "error": None}
@@ -83,8 +85,8 @@ def linked_members(family_id: str) -> list[str]:
     return [k.split(":", 1)[1] for k in _secrets().get("members", {}) if k.startswith(f"{family_id}:")]
 
 
-def _headers(ident: Optional[dict], conversation_id: Optional[str]) -> dict:
-    h = {"Authorization": f"Bearer {token()}", "x-request-id": f"familyos-{uuid.uuid4().hex[:12]}"}
+def _headers(ident: Optional[dict], conversation_id: Optional[str], request_id: Optional[str] = None) -> dict:
+    h = {"Authorization": f"Bearer {token()}", "x-request-id": request_id or f"familyos-{uuid.uuid4().hex[:12]}"}
     if conversation_id:
         h["mcp-session-id"] = conversation_id
     if ident:
@@ -97,11 +99,11 @@ def _headers(ident: Optional[dict], conversation_id: Optional[str]) -> dict:
     return h  # NOTE: x-mcp-take-action is never set — FamilyOS is read-only.
 
 
-async def _with_session(ident, fn, timeout: float, conversation_id=None):
+async def _with_session(ident, fn, timeout: float, conversation_id=None, request_id=None):
     import httpx2
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
-    async with httpx2.AsyncClient(headers=_headers(ident, conversation_id), timeout=timeout) as http:
+    async with httpx2.AsyncClient(headers=_headers(ident, conversation_id, request_id), timeout=timeout) as http:
         async with streamable_http_client(url(), http_client=http) as (read, write):
             async with ClientSession(read, write) as s:
                 await s.initialize()
@@ -137,8 +139,9 @@ def tool_defs(force: bool = False) -> list[dict]:
     return defs
 
 
-def call(tool: str, args: dict, family_id: str, member_id: Optional[str], conversation_id: Optional[str] = None) -> Any:
-    """Call one MF Engine tool as `member_id`. Returns the parsed JSON payload; raises MFEngineError on error payloads."""
+def call(tool: str, args: dict, family_id: str, member_id: Optional[str], conversation_id: Optional[str] = None,
+         request_id: Optional[str] = None) -> Any:
+    """Call one MF Engine tool as `member_id` (`request_id` becomes x-request-id, for audit correlation). Returns the parsed JSON payload; raises MFEngineError on error payloads."""
     name = tool.removeprefix(PREFIX)
     if name in MUTATIONS or name not in ALLOWLIST:
         raise MFEngineError("NOT_ALLOWED", f"{name} is not available to FamilyOS (read-only allowlist)")
@@ -150,7 +153,7 @@ def call(tool: str, args: dict, family_id: str, member_id: Optional[str], conver
     async def go(s):
         return await s.call_tool(name, args)
 
-    res = _run(_with_session(ident, go, 60 if name in HEAVY else 30, conversation_id))
+    res = _run(_with_session(ident, go, 60 if name in HEAVY else 30, conversation_id, request_id))
     payload: Any = None
     for b in res.content or []:
         if getattr(b, "type", None) == "text":

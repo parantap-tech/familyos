@@ -261,3 +261,93 @@ def test_cas_same_isin_in_two_folios_are_separate_holdings():
     p = to_contract_a(cas, "P999", "P999-M1", "x.pdf")
     assert len({r["entity"]["entity_id"] for r in p["financial_records"]}) == 2
     assert "PAN" not in json.dumps(p) and all(k in ("member_id", "name", "relationship") for k in p["members"][0])
+
+
+# ---------------- family coordinator phase 1: consented MF Engine fan-out (no network)
+@pytest.fixture()
+def live_family(client, tmp_path, monkeypatch):
+    """F001 with all three members linked to MF Engine; mf_engine.call recorded instead of hitting the network."""
+    from app import member_gate, mf_engine
+    ids = tmp_path / "ids.json"
+    ids.write_text(json.dumps({"mcp_token": "t", "members": {f"F001:{m}": {"access_token": f"tok-{m}"} for m in ("M001", "M002", "M003")}}))
+    monkeypatch.setenv("MF_ENGINE_IDENTITIES", str(ids))
+    monkeypatch.setenv("MF_ENGINE_MCP_URL", "http://mf-engine.invalid/mcp/investor")
+    monkeypatch.setattr(member_gate, "AUDIT_DIR", tmp_path / "audit")
+    monkeypatch.setattr(mf_engine, "tool_defs", lambda force=False: [])
+    calls = []
+
+    def fake_call(tool, args, family_id, member_id, conversation_id=None, request_id=None):
+        calls.append((member_id, tool, request_id))
+        return {"pan": "ABCDE1234F", "email": "x@example.com", "folio_number": "1234567890",
+                "holdings": [{"scheme_name": "Alpha Flexi Cap", "folio": "98765/43", "current_value": 100000}]}
+    monkeypatch.setattr(mf_engine, "call", fake_call)
+    return client, calls, tmp_path
+
+
+def _consent(client, member, granted=True, scope=None, viewer=None):
+    return client.post(f"/api/family/F001/consent/{member}", json={"viewer_id": viewer or member, "granted": granted, "scope": scope})
+
+
+def test_fan_out_calls_only_consenting_members_and_redacts(live_family):
+    from app.agentic import ToolBox
+    client, calls, tmp = live_family
+    assert _consent(client, "M001").status_code == 200          # Rajesh opts in; Priya does not
+    box = ToolBox(context_engine.store.get("F001"), "M003")     # Arjun asks
+    out = box.run("mf_family", {"tool": "getPortfolioSummary"})
+    assert {c[0] for c in calls} == {"M001", "M003"}             # Priya's login is never used
+    assert out["withheld"] == ["M002"] and out["members"]["M002"]["status"] == "no_consent"
+    rajesh, arjun = out["members"]["M001"]["data"], out["members"]["M003"]["data"]
+    assert "pan" not in rajesh and "email" not in rajesh and rajesh["folio_number"].endswith("7890") and "123456" not in rajesh["folio_number"]
+    assert rajesh["holdings"][0]["folio"] == "••••5/43"
+    assert arjun["pan"] == "ABCDE1234F"                          # the asker's own payload is untouched
+    assert out["members"]["M001"]["source_id"].startswith("MF:M001:getPortfolioSummary:familyos-")
+    audit = [json.loads(l) for l in (tmp / "audit" / "F001.live_mf.jsonl").read_text().splitlines()]
+    assert [(a["asker"], a["on_behalf_of"]) for a in audit] == [("M003", "M001")]
+    assert audit[0]["request_id"] == next(c[2] for c in calls if c[0] == "M001")
+    assert box.withheld_live == {"M002": "has not shared live mutual-fund data with the family"}
+    assert {c["member_id"] for c in box.live_calls} == {"M001", "M003"}
+
+
+def test_consent_is_self_service_scoped_and_revocable(live_family):
+    from app.agentic import ToolBox
+    client, calls, _ = live_family
+    assert _consent(client, "M001", viewer="M003").status_code == 403   # Arjun cannot opt his father in
+    assert _consent(client, "M001", scope=["bogus"]).status_code == 422
+    assert _consent(client, "M001", scope=["liquidity"]).status_code == 200
+    box = ToolBox(context_engine.store.get("F001"), "M003")
+    out = box.run("mf_family", {"tool": "getCapitalGainsSummary", "member_ids": ["M001"]})
+    assert out["members"]["M001"]["status"] == "out_of_scope" and not calls
+    box.run("mf_family", {"tool": "getLiquidityLadder", "args": {"target_amount": 3000000}, "member_ids": ["M001"]})
+    assert calls[-1][:2] == ("M001", "getLiquidityLadder")
+    assert _consent(client, "M001", granted=False).status_code == 200
+    n = len(calls)
+    ToolBox(context_engine.store.get("F001"), "M003").run("mf_family", {"tool": "getLiquidityLadder", "member_ids": ["M001"]})
+    assert len(calls) == n                                        # revoked: no call on the next request
+    status = client.get("/api/family/F001/consent").json()
+    assert {m["member_id"]: m["share_live_mf_with_family"] for m in status["members"]}["M001"] is False
+
+
+def test_mf_family_tool_offered_only_when_someone_else_shares(live_family):
+    from app.agentic import ToolBox
+    client, _, _ = live_family
+    names = lambda: {t["name"] for t in ToolBox(context_engine.store.get("F001"), "M003").tool_defs}
+    assert "mf_family" not in names()
+    _consent(client, "M002")
+    assert "mf_family" in names() and list(names())  # offered once Priya shares
+    with pytest.raises(ValueError, match="not available for family fan-out"):
+        ToolBox(context_engine.store.get("F001"), "M003").run("mf_family", {"tool": "getInvestorProfile"})
+
+
+def test_verify_requires_withheld_members_to_be_named(live_family):
+    from app.agentic import ToolBox, consent_check, withheld_check
+    client, _, _ = live_family
+    _consent(client, "M001")
+    box = ToolBox(context_engine.store.get("F001"), "M003")
+    box.run("mf_family", {"tool": "getPortfolioSummary"})
+    claim = "Our family can raise 30 lakh from mutual funds by March."
+    assert not withheld_check(box, claim, [])["ok"]
+    assert withheld_check(box, claim, ["Priya has not shared live mutual-fund data"])["ok"]
+    assert withheld_check(box, "Rajesh can raise 10 lakh.", [])["ok"]          # not a family-wide claim
+    assert consent_check(box)["ok"]
+    _consent(client, "M001", granted=False)                                     # revoked mid-answer
+    assert not consent_check(box)["ok"]

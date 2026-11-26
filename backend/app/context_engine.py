@@ -472,6 +472,24 @@ class ContextStore:
         self._p(family_id, "goals").write_text(json.dumps(ctx.goals, indent=2))
         self._mirror(family_id)
 
+    def set_live_consent(self, family_id: str, member_id: str, granted: bool, scope: Optional[list[str]] = None) -> dict:
+        """A member opts in or out of sharing their live MF Engine data for family questions.
+        Takes effect on the next request; callers must check that the requester *is* `member_id`."""
+        ctx = self.get(family_id)
+        if member_id not in ctx.members:
+            raise ValueError(f"{member_id} is not a member of {family_id}")
+        path = self._p(family_id, "access")
+        doc = self._load_json(path, {"family_id": family_id, "policies": {}})
+        pol = doc.setdefault("policies", {}).setdefault(member_id, {"share_with_family": False, "private_record_ids": []})
+        pol["share_live_mf_with_family"] = bool(granted)
+        if granted:
+            pol["live_mf_consent"] = {"granted_at": TODAY.isoformat(), "granted_by": member_id, "scope": scope or None}
+        else:
+            pol.pop("live_mf_consent", None)
+        path.write_text(json.dumps(doc, indent=2))
+        ctx.access[member_id] = pol   # live context sees it immediately; no rebuild needed
+        return {"member_id": member_id, **{k: pol.get(k) for k in ("share_live_mf_with_family", "live_mf_consent")}}
+
     def reset(self, family_id: str) -> None:
         for kind in ("ingested", "goals"):
             self._p(family_id, kind).unlink(missing_ok=True)
