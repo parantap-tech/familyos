@@ -29,7 +29,7 @@ from typing import Any, Iterator, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from . import finance, graph_store, llm, mf_engine
+from . import finance, graph_store, llm, member_gate, mf_engine
 from .context_engine import TODAY, FamilyContext, Fact, store
 from .money import CRORE, LAKH, inr, inr_short, pct, q
 
@@ -157,6 +157,19 @@ TOOLS = [
     },
 ]
 
+MF_FAMILY_TOOL = {
+    "name": "mf_family",
+    "description": "LIVE mutual-fund data for several family members at once: runs one read-only MF Engine tool for each member, "
+                   "each under that member's own login, in parallel. Only members who have opted in to sharing live data are "
+                   "included; everyone else comes back under `withheld` with a reason. Results are keyed by member_id; each "
+                   "successful result carries a source_id for provenance. Other members' identifiers are redacted.",
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["tool"], "properties": {
+        "tool": {"type": "string", "enum": sorted(member_gate.FAMILY_SAFE)},
+        "args": {"type": "object", "description": "Arguments for that MF Engine tool, e.g. {\"target_amount\": 3000000, \"needed_by\": \"2027-03-31\"} for getLiquidityLadder."},
+        "member_ids": {**MEMBER_IDS, "description": "Members to include; omit for the whole family."},
+    }},
+}
+
 SYSTEM = """You are FamilyOS, an AI that understands a family as one interconnected financial system (India; amounts in INR, \
 use lakh/crore naturally). You answer questions from one family member, reasoning across ALL members whose data they may see.
 
@@ -180,9 +193,15 @@ policy, co-pay, waiting periods), loan moratoriums (future EMIs), and AIS vs ITR
 or "protection for the family", never graphic or alarming wording, and focus on what would keep the family secure.
 - Tools prefixed mf_ are LIVE mutual-fund data from MF Engine for the asker only (holdings, XIRR, capital gains, \
 tax-aware redemption plans, SIPs, stress tests). Prefer them for mutual-fund questions; their numbers are verified facts. \
+Use mf_getLiquidityLadder (target_amount, needed_by) when a goal needs cash from mutual funds, e.g. a down payment; \
+use mf_getHouseholdTaxHarvestPlan for family tax-harvesting questions (it covers every member only when the asker is the \
+MF Engine family head; otherwise relay its visibility_note). \
 Resolve scheme ids from earlier results, never invent them. They cannot place orders: point to the MF Engine app for that. \
 When you use them, end the answer with: "Mutual fund investments are subject to market risks." \
 If an mf_ tool returns an error, continue with FamilyOS records and say live data was unavailable.
+- For questions about the whole family's mutual funds use mf_family (the other mf_ tools cover the asker only). Members under \
+`withheld` have not shared live data: never estimate their holdings; name them in missing_information and use only their \
+FamilyOS records you can see. To combine members' figures, use calculate on the returned numbers.
 - Be efficient: gather what you need in one or two rounds of parallel tool calls, then answer. Keep the answer short — detail lives in findings.
 - Finish by calling final_answer exactly once."""
 
@@ -199,7 +218,11 @@ class ToolBox:
         self.live_calls: list[dict] = []   # MF Engine calls (provenance for live data)
         # Live MF Engine tools only when the asker has linked their own MF Engine login (one identity per request).
         self.mf_tools = mf_engine.tool_defs() if mf_engine.identity(ctx.family_id, asker) else []
-        self.tool_defs = TOOLS[:-1] + self.mf_tools + TOOLS[-1:]   # keep final_answer last
+        # Consented fan-out to other members' MF Engine logins (docs/design/family-coordinator.md).
+        self.gate = member_gate.MemberGate(ctx, asker)
+        self.withheld_live: dict[str, dict[str, str]] = {}   # member_id -> {tool: reason} for refused live reads
+        fan = [MF_FAMILY_TOOL] if mf_engine.configured() and self.gate.any_delegate_possible() else []
+        self.tool_defs = TOOLS[:-1] + self.mf_tools + fan + TOOLS[-1:]   # keep final_answer last
 
     def _n(self, mid: str) -> str:
         return self.ctx.members[mid].name
@@ -394,12 +417,30 @@ class ToolBox:
         store.remember_goal(self.ctx.family_id, goal)
         return {"saved": goal}
 
+    def mf_family(self, tool: str, args: dict | None = None, member_ids: list[str] | None = None) -> dict:
+        self._check_members(member_ids)
+        t0 = time.perf_counter()
+        out = member_gate.fan_out(self.gate, tool, args or {}, member_ids)
+        ms = round((time.perf_counter() - t0) * 1000)
+        for c in out.pop("_calls"):
+            self.live_calls.append({"tool": tool, "args": args or {}, "ms": ms, "source": "MF Engine (live)",
+                                    "member_id": c["member_id"], "member": self._n(c["member_id"]), "gate": c["gate"],
+                                    "status": c["status"], "source_id": c["source_id"], "request_id": c["request_id"]})
+        for mid in out["withheld"]:
+            self.withheld_live.setdefault(mid, {})[tool] = out["members"][mid]["reason"]
+        out["members"] = {mid: {**r, "member": self._n(mid)} for mid, r in out["members"].items()}
+        out["disclaimer"] = "Mutual fund investments are subject to market risks. Read all scheme related documents carefully."
+        return out
+
     def run(self, name: str, args: dict) -> dict:
+        if name == "mf_family":
+            return self.mf_family(**args)
         if name.startswith(mf_engine.PREFIX):
             t0 = time.perf_counter()
             out = mf_engine.call(name, args, self.ctx.family_id, self.asker)
             self.live_calls.append({"tool": name.removeprefix(mf_engine.PREFIX), "args": args,
-                                    "ms": round((time.perf_counter() - t0) * 1000), "source": "MF Engine (live)"})
+                                    "ms": round((time.perf_counter() - t0) * 1000), "source": "MF Engine (live)",
+                                    "member_id": self.asker, "member": self._n(self.asker), "gate": "self", "status": "ok"})
             return {"source": "MF Engine live data for " + self._n(self.asker), "data": out,
                     "disclaimer": "Mutual fund investments are subject to market risks. Read all scheme related documents carefully."}
         fn = getattr(self, name, None)
@@ -592,6 +633,8 @@ def verify(state: AState, config) -> AState:
         {"check": "Numbers come from deterministic tools or live MF Engine data",
          "ok": bool(box.calcs) or bool(box.live_calls) or not numbers(claims),
          "detail": f"{len(box.calcs)} calcs, {len(box.live_calls)} live MF Engine calls"},
+        consent_check(box),
+        withheld_check(box, claims, f["missing_information"]),
     ]
     ok = all(c["ok"] for c in checks)
     upd: AState = {"checks": checks, "trace": _t(state, "Verification", t0,
@@ -602,10 +645,34 @@ def verify(state: AState, config) -> AState:
             problems.append(f"These numbers do not appear in any tool result: {', '.join(bad)}. Compute them with calculate (or remove them).")
         if unknown_ids:
             problems.append(f"These record ids are unknown or not visible: {', '.join(unknown_ids)}.")
+        if not checks[-1]["ok"]:
+            problems.append(f"Some live mutual-fund data was withheld ({checks[-1]['detail']}); name each of these members and "
+                            "what was not shared in missing_information, and do not describe the result as covering the whole "
+                            "family's mutual funds.")
         state["messages"].append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": state["final_block_id"],
                                                                "content": "Verification failed. " + " ".join(problems), "is_error": True}]})
         upd.update(repairs=state["repairs"] + 1, final=None, messages=state["messages"])
     return upd
+
+
+_WHOLE_FAMILY = re.compile(r"\b(our|the|whole|entire) (family|household)\b|\beveryone\b|\ball of (us|you)\b|\bhousehold\b", re.I)
+
+
+def consent_check(box: ToolBox) -> dict:
+    """Structural guarantee re-checked: every live call made for someone other than the asker passed the gate."""
+    bad = [c["member"] for c in box.live_calls
+           if c.get("member_id") != box.asker and box.gate.status(c["member_id"], c["tool"]) != "ok"]
+    return {"check": "Live data used only for members who shared it", "ok": not bad, "detail": ", ".join(bad)}
+
+
+def withheld_check(box: ToolBox, claims: str, missing: list[str]) -> dict:
+    """A family-wide answer must name the members whose live data was withheld."""
+    if not box.withheld_live or not _WHOLE_FAMILY.search(claims):
+        return {"check": "Withheld members acknowledged", "ok": True, "detail": ""}
+    text = " ".join(missing).lower()
+    unnamed = [f"{box._n(m)} ({', '.join(by_tool)})" for m, by_tool in box.withheld_live.items()
+               if box._n(m).split()[0].lower() not in text]
+    return {"check": "Withheld members acknowledged", "ok": not unnamed, "detail": ", ".join(unnamed)}
 
 
 def respond(state: AState, config) -> AState:
@@ -647,6 +714,10 @@ def respond(state: AState, config) -> AState:
         "plan": {"tool_calls": len(tool_calls), "llm_turns": state["turns"]},
         "withheld_record_count": box.hidden,
         "live_sources": box.live_calls,
+        "withheld_live_members": [{"member_id": m, "member": box._n(m),
+                                   "withheld": [{"tool": t, "reason": r} for t, r in by_tool.items()],
+                                   "contributed_live_data": any(c["member_id"] == m and c["status"] == "ok" for c in box.live_calls)}
+                                  for m, by_tool in box.withheld_live.items()],
         "remembered_goals": store.get(ctx.family_id).goals,
         "trace": trace,
     }
