@@ -32,6 +32,33 @@ Financial Data Engine ──Contract A──▶ Context Engine ─────�
 - **Consent.** Arjun's crypto wallet (R018) is marked private. When you view as Rajesh or Priya, it is excluded and the UI says so.
 - **Memory.** Asking about a house stores a family goal. A later "what if father retires?" re-evaluates that goal automatically.
 
+## Live mutual-fund demo (no MF Engine needed)
+
+```bash
+./demo-live.sh      # seeds backend/.demo/, starts the mock MF Engine on :9300, then runs ./dev.sh against the demo data
+```
+
+`backend/tools/seed_live_demo.py` copies the families into `backend/.demo/` (gitignored; tracked `backend/data` is never
+written), sets each member's live-data consent, and writes an MF Engine identities file pointing at personas in
+`backend/tools/mock_mf_engine_mcp.py`. It prints the cast and questions to try.
+
+- **F001 (story):** Arjun asks. Rajesh shares and is the MF Engine family head (₹40k LTCG already booked). Priya is
+  linked but hasn't shared, so she is withheld, and her SIP mandate has expired.
+- **F002 (consent matrix):**
+
+  | Member | Live-data state |
+  |---|---|
+  | Suresh | the asker |
+  | Meera | shares everything; exemption used up |
+  | Venkatesh | shares liquidity only |
+  | Kamala | linked, not shared |
+  | Ananya | shares, but her login has expired |
+  | Rohan | minor; empty portfolio |
+  | Karthik | never linked |
+
+The mock's numbers are synthetic but consistent (lot-level tax buckets, ELSS lock-in, exit loads, FIFO). The agentic
+path needs a Claude key; without one, the deterministic pipeline answers and never calls MF Engine tools.
+
 ## Demo script (3 minutes)
 1. **Overview** (KPIs, context graph, Members tab). Hover over Rajesh in the graph to show the joint loan and the nominee link.
 2. Viewing as **Arjun**, ask *"Can our family afford to buy a ₹1.5 crore house next year?"*. Walk through the pooled

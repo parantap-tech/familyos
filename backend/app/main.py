@@ -253,6 +253,38 @@ def mf_engine_info(family_id: Optional[str] = None):
     return out
 
 
+class LiveConsentRequest(BaseModel):
+    viewer_id: str                     # who is making the change; must be the member themselves
+    granted: bool
+    scope: Optional[list[str]] = None  # subset of member_gate.SCOPES; None = every family-safe tool
+
+
+@app.get("/api/family/{family_id}/consent")
+def live_consent_status(family_id: str):
+    """Who shares live MF Engine data with the family, and who has linked an MF Engine login at all."""
+    from . import member_gate
+    ctx = _ctx(family_id)
+    linked = set(mf_engine.linked_members(family_id))
+    return {"scopes": member_gate.SCOPES, "members": [
+        {"member_id": m, "name": ctx.members[m].name, "linked": m in linked,
+         "share_live_mf_with_family": bool(ctx.access.get(m, {}).get("share_live_mf_with_family")),
+         "live_mf_consent": ctx.access.get(m, {}).get("live_mf_consent")} for m in ctx.members]}
+
+
+@app.post("/api/family/{family_id}/consent/{member_id}")
+def set_live_consent(family_id: str, member_id: str, req: LiveConsentRequest):
+    """Only the member can grant or revoke sharing of their own live mutual-fund data."""
+    from . import member_gate
+    ctx = _ctx(family_id)
+    _viewer(ctx, member_id)
+    if req.viewer_id != member_id:
+        raise HTTPException(403, "only the member themselves can change sharing of their live mutual-fund data")
+    bad = sorted(set(req.scope or []) - set(member_gate.SCOPES))
+    if bad:
+        raise HTTPException(422, f"unknown scope(s) {bad}; valid: {member_gate.SCOPES}")
+    return store.set_live_consent(family_id, member_id, req.granted, req.scope)
+
+
 @app.post("/api/contract/validate")
 def validate_contract(payload: dict):
     """Dry run for the Financial Data Engine: validate a Contract A payload (full snapshot or record batch)
